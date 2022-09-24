@@ -6,15 +6,17 @@ import random
 from pathlib import Path
 from typing import Optional
 
+import pandas as pd
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
-from datasets import load_dataset
+from datasets import load_dataset, Image, Dataset, DatasetDict
 from diffusers import AutoencoderKL, DDPMScheduler, PNDMScheduler, StableDiffusionPipeline, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
 from diffusers.pipelines.stable_diffusion import StableDiffusionSafetyChecker
@@ -28,22 +30,32 @@ logger = get_logger(__name__)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Simple example of a training script.")
+    parser = argparse.ArgumentParser(
+        description="Simple example of a training script.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        default=None,
-        required=True,
+        default="CompVis/stable-diffusion-v1-4",
+        # required=True,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
         "--dataset_name",
         type=str,
+        # default="lambdalabs/pokemon-blip-captions",
         default=None,
         help=(
             "The name of the Dataset (from the HuggingFace hub) to train on (could be your own, possibly private,"
             " dataset)."
         ),
+    )
+    parser.add_argument(
+        "--cinemanet_dset_path",
+        type=str,
+        default="/home/synopsis/datasets/stable-diffusion/cinemanet-captions-angle-and-framing-only.feather",
+        help=("Path to the cinematic dataset .feather file with selected captions"),
     )
     parser.add_argument(
         "--dataset_config_name",
@@ -85,7 +97,7 @@ def parse_args():
     parser.add_argument(
         "--train_val_split",
         type=float,
-        default=0.15,
+        default=0.01,
         help="Percent to split off of train for validation",
     )
     parser.add_argument(
@@ -121,10 +133,10 @@ def parse_args():
         help="whether to randomly flip images horizontally",
     )
     parser.add_argument(
-        "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size", type=int, default=1, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument(
-        "--eval_batch_size", type=int, default=16, help="Batch size (per device) for the eval dataloader."
+        "--eval_batch_size", type=int, default=1, help="Batch size (per device) for the eval dataloader."
     )
     parser.add_argument("--num_train_epochs", type=int, default=100)
     parser.add_argument(
@@ -241,6 +253,21 @@ def freeze_params(params):
 dataset_name_mapping = {
     "image_caption_dataset.py": ("image_path", "caption"),
 }
+
+
+def hf_cinematic_dataset(path_feather_file) -> DatasetDict:
+    df = pd.read_feather(path_feather_file)
+    df = df.rename(
+        columns={
+            "caption": "text",
+            "filepath": "image",
+        }
+    )
+    dset = Dataset.from_pandas(df)
+    dset = dset.cast_column("image", Image())
+    dset = DatasetDict({"train": dset})
+
+    return dset
 
 
 class EMAModel:
@@ -380,7 +407,10 @@ def main():
 
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
-    if args.dataset_name is not None:
+    if args.cinemanet_dset_path is not None:
+        print("!!" * 40, "Using Cinematic Training Data", "!!" * 40)
+        dataset = hf_cinematic_dataset(args.cinemanet_dset_path)
+    elif args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
         dataset = load_dataset(
             args.dataset_name,
@@ -453,18 +483,18 @@ def main():
 
     train_transforms = transforms.Compose(
         [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
-            transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
+            transforms.Resize((args.resolution, args.resolution), interpolation=transforms.InterpolationMode.BILINEAR, antialias=True),
+            # transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
+            # transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),
         ]
     )
     val_transforms = transforms.Compose(
         [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution),
-            transforms.ToTensor(),
+            transforms.Resize((args.resolution, args.resolution), interpolation=transforms.InterpolationMode.BILINEAR, antialias=True),
+            # transforms.CenterCrop(args.resolution),
+            # transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),
         ]
     )
