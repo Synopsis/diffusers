@@ -230,7 +230,8 @@ def parse_args():
 
     # Sanity checks
     if args.dataset_name is None and args.train_data_dir is None and args.validation_data_dir is None:
-        raise ValueError("Need either a dataset name or a training/validation folder.")
+        if args.cinemanet_dset_path is None:
+            raise ValueError("Need either a dataset name or a training/validation folder.")
 
     return args
 
