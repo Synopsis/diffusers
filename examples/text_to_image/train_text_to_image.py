@@ -238,6 +238,37 @@ def parse_args():
     return args
 
 
+"""
+accelerate config
+
+huggingface-cli login
+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
+
+# python train_text_to_image.py \
+python train_text_to_image.py \
+    --use_auth_token \
+    --cinemanet_dset_path /home/synopsis/datasets/stable-diffusion/cinemanet-captions.feather \
+    --mixed_precision fp16 \
+    --resolution 512 \
+    --gradient_accumulation_steps 4 \
+    --train_batch_size 1 \
+    --num_train_epochs 1 \
+    --use_ema \
+    --output_dir sd-tmp
+
+
+accelerate launch train_text_to_image.py \
+    --dataset_name lambdalabs/pokemon-blip-captions \
+    --use_auth_token \
+    --mixed_precision fp16 \
+    --resolution 512 \
+    --gradient_accumulation_steps 4 \
+    --train_batch_size 1 \
+    --num_train_epochs 1 \
+    --output_dir sd-pokemon
+"""
+
+
 def get_full_repo_name(model_id: str, organization: Optional[str] = None, token: Optional[str] = None):
     if token is None:
         token = HfFolder.get_token()
@@ -393,7 +424,7 @@ def main():
     # -- Freeze first 2/4 upsampling blocks
     assert len(unet.up_blocks) == 4
     freeze_params(unet.up_blocks[0].parameters())
-    freeze_params(unet.up_blocks[1].parameters())
+    # freeze_params(unet.up_blocks[1].parameters())
     # freeze_params(unet.up_blocks[2].parameters())
     # freeze_params(unet.up_blocks[3].parameters())
 
