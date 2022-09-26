@@ -567,7 +567,7 @@ def main():
     )
 
     if args.use_ema:
-        ema_unet = EMAModel(unet)
+        ema_unet = EMAModel(unet, device="cpu")
 
     # Move vae and unet to device
     vae.to(accelerator.device)
