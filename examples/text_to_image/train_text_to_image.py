@@ -383,6 +383,22 @@ def main():
     freeze_params(vae.parameters())
     freeze_params(text_encoder.parameters())
 
+    # Freeze parts of UNet
+    freeze_params(unet.time_proj.parameters())
+    freeze_params(unet.time_embedding.parameters())
+    freeze_params(unet.conv_in.parameters())
+    freeze_params(unet.down_blocks.parameters())
+    freeze_params(unet.mid_block.parameters())
+
+    # -- Freeze first 2/4 upsampling blocks
+    assert len(unet.up_blocks) == 4
+    freeze_params(unet.up_blocks[0].parameters())
+    freeze_params(unet.up_blocks[1].parameters())
+    # freeze_params(unet.up_blocks[2].parameters())
+    # freeze_params(unet.up_blocks[3].parameters())
+
+    logger.info("Froze upto 2nd upsampling block of the UNet")
+
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
 
