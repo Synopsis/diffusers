@@ -121,7 +121,9 @@ def parse_args():
             "The resolution for input images, all the images in the train/validation dataset will be resized to this"
             " resolution"
         ),
-    )
+    ),
+    # parser.add_argument("--img_height", type=int, default=512, help="Image height"),
+    # parser.add_argument("--img_width", type=int, default=512, help="Image height"),
     parser.add_argument(
         "--center_crop",
         action="store_true",
@@ -485,6 +487,7 @@ def main():
     train_transforms = transforms.Compose(
         [
             transforms.Resize((args.resolution, args.resolution), interpolation=transforms.InterpolationMode.BILINEAR, antialias=True),
+            # transforms.Resize((args.img_height, args.img_width), interpolation=transforms.InterpolationMode.BILINEAR, antialias=True),
             # transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
             # transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
             transforms.ToTensor(),
@@ -494,6 +497,7 @@ def main():
     val_transforms = transforms.Compose(
         [
             transforms.Resize((args.resolution, args.resolution), interpolation=transforms.InterpolationMode.BILINEAR, antialias=True),
+            # transforms.Resize((args.img_height, args.img_width), interpolation=transforms.InterpolationMode.BILINEAR, antialias=True),
             # transforms.CenterCrop(args.resolution),
             # transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),
