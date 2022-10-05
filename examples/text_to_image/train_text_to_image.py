@@ -6,6 +6,7 @@ import os
 import random
 from pathlib import Path
 from typing import Optional
+from upyog.imports import *
 
 import pandas as pd
 import numpy as np
@@ -243,7 +244,7 @@ def parse_args():
         args.local_rank = env_local_rank
 
     # Sanity checks
-    if args.dataset_name is None and args.train_data_dir is None and args.validation_data_dir is None:
+    if args.dataset_name is None and args.train_data_dir is None:
         if args.cinemanet_dset_path is None:
             raise ValueError("Need either a dataset name or a training/validation folder.")
 
@@ -426,6 +427,16 @@ def main():
     # Freeze vae and text_encoder
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
+
+    unet.time_proj.requires_grad_(False)
+    unet.time_embedding.requires_grad_(False)
+    unet.conv_in.requires_grad_(False)
+    unet.down_blocks.requires_grad_(False)
+    unet.mid_block.requires_grad_(False)
+
+    # -- Freeze first 2/4 upsampling blocks
+    assert len(unet.up_blocks) == 4
+    unet.up_blocks[0].requires_grad_(False)
 
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
@@ -631,58 +642,108 @@ def main():
     progress_bar.set_description("Steps")
     global_step = 0
 
-    for epoch in range(args.num_train_epochs):
-        unet.train()
-        train_loss = 0.0
-        for step, batch in enumerate(train_dataloader):
-            with accelerator.accumulate(unet):
-                # Convert images to latent space
-                latents = vae.encode(batch["pixel_values"]).latent_dist.sample()
-                latents = latents * 0.18215
+    try:
+        for epoch in range(args.num_train_epochs):
+            unet.train()
+            train_loss = 0.0
+            for step, batch in enumerate(train_dataloader):
+                with accelerator.accumulate(unet):
+                    # Convert images to latent space
+                    latents = vae.encode(batch["pixel_values"]).latent_dist.sample()
+                    latents = latents * 0.18215
 
-                # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)
-                bsz = latents.shape[0]
-                # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (bsz,), device=latents.device).long()
+                    # Sample noise that we'll add to the latents
+                    noise = torch.randn_like(latents)
+                    bsz = latents.shape[0]
+                    # Sample a random timestep for each image
+                    timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (bsz,), device=latents.device).long()
 
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+                    # Add noise to the latents according to the noise magnitude at each timestep
+                    # (this is the forward diffusion process)
+                    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-                # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                    # Get the text embedding for conditioning
+                    encoder_hidden_states = text_encoder(batch["input_ids"])[0]
 
-                # Predict the noise residual and compute loss
-                noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-                loss = F.mse_loss(noise_pred, noise, reduction="mean")
+                    # Predict the noise residual and compute loss
+                    noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                    loss = F.mse_loss(noise_pred, noise, reduction="mean")
 
-                # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
-                train_loss += avg_loss.item() / args.gradient_accumulation_steps
+                    # Gather the losses across all processes for logging (if we use distributed training).
+                    avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
+                    train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
-                # Backpropagate
-                accelerator.backward(loss)
+                    # Backpropagate
+                    accelerator.backward(loss)
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
+
+                # Checks if the accelerator has performed an optimization step behind the scenes
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+                    if args.use_ema:
+                        ema_unet.step(unet)
+                    progress_bar.update(1)
+                    global_step += 1
+                    accelerator.log({"train_loss": train_loss}, step=global_step)
+                    train_loss = 0.0
 
-            # Checks if the accelerator has performed an optimization step behind the scenes
-            if accelerator.sync_gradients:
-                if args.use_ema:
-                    ema_unet.step(unet)
-                progress_bar.update(1)
-                global_step += 1
-                accelerator.log({"train_loss": train_loss}, step=global_step)
-                train_loss = 0.0
+                logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+                progress_bar.set_postfix(**logs)
 
-            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
-            progress_bar.set_postfix(**logs)
+                if global_step >= args.max_train_steps:
+                    break
 
-            if global_step >= args.max_train_steps:
-                break
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
+                pipeline = StableDiffusionPipeline(
+                    text_encoder=text_encoder,
+                    vae=vae,
+                    unet=accelerator.unwrap_model(ema_unet.averaged_model if args.use_ema else unet),
+                    tokenizer=tokenizer,
+                    scheduler=PNDMScheduler(
+                        beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", skip_prk_steps=True
+                    ),
+                    safety_checker=StableDiffusionSafetyChecker.from_pretrained("CompVis/stable-diffusion-safety-checker"),
+                    feature_extractor=CLIPFeatureExtractor.from_pretrained("openai/clip-vit-base-patch32"),
+                )
+                try:
+                    save_dir = Path(args.output_dir) / f"epoch-{epoch}"
+                    save_dir.mkdir(exist_ok=True)
+                    save_dir = str(save_dir)
+                    pipeline.save_pretrained(save_dir)
+                except:
+                    breakpoint()
+
+    # FIXME: Duplicated chunk from before, but whatever...
+    except KeyboardInterrupt:
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            pipeline = StableDiffusionPipeline(
+                text_encoder=text_encoder,
+                vae=vae,
+                unet=accelerator.unwrap_model(ema_unet.averaged_model if args.use_ema else unet),
+                tokenizer=tokenizer,
+                scheduler=PNDMScheduler(
+                    beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", skip_prk_steps=True
+                ),
+                safety_checker=StableDiffusionSafetyChecker.from_pretrained("CompVis/stable-diffusion-safety-checker"),
+                feature_extractor=CLIPFeatureExtractor.from_pretrained("openai/clip-vit-base-patch32"),
+            )
+            save_dir = Path(args.output_dir) / "end-of-training"
+            save_dir.mkdir(exist_ok=True)
+            save_dir = str(save_dir)
+            pipeline.save_pretrained(save_dir)
+            # pipeline.save_pretrained(args.output_dir)
+
+            if args.push_to_hub:
+                repo.push_to_hub(
+                    args, pipeline, repo, commit_message="End of training", blocking=False, auto_lfs_prune=True
+                )
+
+        accelerator.end_training()
 
     # Create the pipeline using the trained modules and save it.
     accelerator.wait_for_everyone()
@@ -698,7 +759,11 @@ def main():
             safety_checker=StableDiffusionSafetyChecker.from_pretrained("CompVis/stable-diffusion-safety-checker"),
             feature_extractor=CLIPFeatureExtractor.from_pretrained("openai/clip-vit-base-patch32"),
         )
-        pipeline.save_pretrained(args.output_dir)
+        save_dir = Path(args.output_dir) / "end-of-training"
+        save_dir.mkdir(exist_ok=True)
+        save_dir = str(save_dir)
+        pipeline.save_pretrained(save_dir)
+        # pipeline.save_pretrained(args.output_dir)
 
         if args.push_to_hub:
             repo.push_to_hub(
