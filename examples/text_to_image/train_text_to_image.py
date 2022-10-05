@@ -1,5 +1,6 @@
 import argparse
 import copy
+import logging
 import math
 import os
 import random
@@ -64,9 +65,6 @@ def parse_args():
         help="The config of the Dataset, leave as None if there's only one config.",
     )
     parser.add_argument("--train_data_dir", type=str, default=None, help="A folder containing the training data.")
-    parser.add_argument(
-        "--validation_data_dir", type=str, default=None, help="A folder containing the validation data."
-    )
     parser.add_argument(
         "--image_column", type=str, default="image", help="The column of the dataset containing an image."
     )
@@ -182,11 +180,15 @@ def parse_args():
     parser.add_argument(
         "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
     )
+    parser.add_argument(
+        "--use_8bit_adam", action="store_true", help="Whether or not to use 8-bit Adam from bitsandbytes."
+    )
     parser.add_argument("--use_ema", action="store_true", help="Whether to use EMA model.")
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
     parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
     parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
     parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
+    parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
     parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
     parser.add_argument(
         "--use_auth_token",
@@ -221,6 +223,16 @@ def parse_args():
             "Whether to use mixed precision. Choose"
             "between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >= 1.10."
             "and an Nvidia Ampere GPU."
+        ),
+    )
+    parser.add_argument(
+        "--report_to",
+        type=str,
+        default="tensorboard",
+        help=(
+            'The integration to report the results and logs to. Supported platforms are `"tensorboard"`,'
+            ' `"wandb"` and `"comet_ml"`. Use `"all"` (default) to report to all integrations.'
+            "Only applicable when `--with_tracking` is passed."
         ),
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
@@ -277,11 +289,6 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
         return f"{username}/{model_id}"
     else:
         return f"{organization}/{model_id}"
-
-
-def freeze_params(params):
-    for param in params:
-        param.requires_grad = False
 
 
 dataset_name_mapping = {
@@ -369,8 +376,14 @@ def main():
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
-        log_with="tensorboard",
+        log_with=args.report_to,
         logging_dir=logging_dir,
+    )
+
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
     )
 
     # If passed along, set the training seed now.
@@ -411,24 +424,8 @@ def main():
     )
 
     # Freeze vae and text_encoder
-    freeze_params(vae.parameters())
-    freeze_params(text_encoder.parameters())
-
-    # Freeze parts of UNet
-    freeze_params(unet.time_proj.parameters())
-    freeze_params(unet.time_embedding.parameters())
-    freeze_params(unet.conv_in.parameters())
-    freeze_params(unet.down_blocks.parameters())
-    freeze_params(unet.mid_block.parameters())
-
-    # -- Freeze first 2/4 upsampling blocks
-    assert len(unet.up_blocks) == 4
-    freeze_params(unet.up_blocks[0].parameters())
-    # freeze_params(unet.up_blocks[1].parameters())
-    # freeze_params(unet.up_blocks[2].parameters())
-    # freeze_params(unet.up_blocks[3].parameters())
-
-    logger.info("Froze upto 2nd upsampling block of the UNet")
+    vae.requires_grad_(False)
+    text_encoder.requires_grad_(False)
 
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
@@ -439,7 +436,19 @@ def main():
         )
 
     # Initialize the optimizer
-    optimizer = torch.optim.AdamW(
+    if args.use_8bit_adam:
+        try:
+            import bitsandbytes as bnb
+        except ImportError:
+            raise ImportError(
+                "Please install bitsandbytes to use 8-bit Adam. You can do so by running `pip install bitsandbytes`"
+            )
+
+        optimizer_cls = bnb.optim.AdamW8bit
+    else:
+        optimizer_cls = torch.optim.AdamW
+
+    optimizer = optimizer_cls(
         unet.parameters(),
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
@@ -472,8 +481,6 @@ def main():
         data_files = {}
         if args.train_dir is not None:
             data_files["train"] = os.path.join(args.train_dir, "**")
-        if args.validation_dir is not None:
-            data_files["validation"] = os.path.join(args.validation_dir, "**")
         dataset = load_dataset(
             "imagefolder",
             data_files=data_files,
@@ -481,13 +488,6 @@ def main():
         )
         # See more about loading custom images at
         # https://huggingface.co/docs/datasets/v2.4.0/en/image_process#imagefolder.
-
-    # If we don't have a validation split, split off a percentage of train as validation.
-    args.train_val_split = None if "validation" in dataset.keys() else args.train_val_split
-    if isinstance(args.train_val_split, float) and args.train_val_split > 0.0:
-        split = dataset["train"].train_test_split(args.train_val_split)
-        dataset["train"] = split["train"]
-        dataset["validation"] = split["test"]
 
     # Preprocessing the datasets.
     # We need to tokenize inputs and targets.
@@ -526,9 +526,8 @@ def main():
                 raise ValueError(
                     f"Caption column `{caption_column}` should contain either strings or lists of strings."
                 )
-        input_ids = tokenizer(
-            captions, max_length=tokenizer.model_max_length, padding="do_not_pad", truncation=True
-        ).input_ids
+        inputs = tokenizer(captions, max_length=tokenizer.model_max_length, padding="do_not_pad", truncation=True)
+        input_ids = inputs.input_ids
         return input_ids
 
     train_transforms = transforms.Compose(
@@ -558,32 +557,17 @@ def main():
 
         return examples
 
-    def preprocess_val(examples):
-        images = [image.convert("RGB") for image in examples[image_column]]
-        examples["pixel_values"] = [val_transforms(image) for image in images]
-        examples["input_ids"] = tokenize_captions(examples, is_train=False)
-        return examples
-
     with accelerator.main_process_first():
         if args.max_train_samples is not None:
             dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
         # Set the training transforms
         train_dataset = dataset["train"].with_transform(preprocess_train)
-        if args.max_eval_samples is not None:
-            dataset["validation"] = dataset["validation"].shuffle(seed=args.seed).select(range(args.max_eval_samples))
-        # Set the validation transforms
-        # eval_dataset = dataset["validation"].with_transform(preprocess_val)
 
     def collate_fn(examples):
         pixel_values = torch.stack([example["pixel_values"] for example in examples])
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
         input_ids = [example["input_ids"] for example in examples]
-        padded_tokens = tokenizer.pad(
-            {"input_ids": input_ids},
-            padding=True,
-            max_length=tokenizer.model_max_length,
-            return_tensors="pt",
-        )
+        padded_tokens = tokenizer.pad({"input_ids": input_ids}, padding=True, return_tensors="pt")
         return {
             "pixel_values": pixel_values,
             "input_ids": padded_tokens.input_ids,
@@ -593,7 +577,6 @@ def main():
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset, shuffle=True, collate_fn=collate_fn, batch_size=args.train_batch_size
     )
-    # eval_dataloader = torch.utils.data.DataLoader(eval_dataset, collate_fn=collate_fn, batch_size=args.eval_batch_size)
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -642,6 +625,7 @@ def main():
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
+
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
@@ -649,6 +633,7 @@ def main():
 
     for epoch in range(args.num_train_epochs):
         unet.train()
+        train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
                 # Convert images to latent space
@@ -672,28 +657,35 @@ def main():
                 noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
                 loss = F.mse_loss(noise_pred, noise, reduction="mean")
 
+                # Gather the losses across all processes for logging (if we use distributed training).
+                avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
+                train_loss += avg_loss.item() / args.gradient_accumulation_steps
+
+                # Backpropagate
                 accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
-                progress_bar.update(1)
-                global_step += 1
                 if args.use_ema:
                     ema_unet.step(unet)
+                progress_bar.update(1)
+                global_step += 1
+                accelerator.log({"train_loss": train_loss}, step=global_step)
+                train_loss = 0.0
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
-            accelerator.log(logs, step=global_step)
 
             if global_step >= args.max_train_steps:
                 break
 
-        accelerator.wait_for_everyone()
-
     # Create the pipeline using the trained modules and save it.
+    accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         pipeline = StableDiffusionPipeline(
             text_encoder=text_encoder,
