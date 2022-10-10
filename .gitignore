@@ -164,3 +164,10 @@ tags
 
 # DS_Store (MacOS)
 .DS_Store
+
+# files
+examples/text_to_image/*.feather
+examples/text_to_image/imgs
+examples/text_to_image/*ipynb
+examples/text_to_image/*/*
+examples/textual_inversion/*/*
