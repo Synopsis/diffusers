@@ -258,6 +258,18 @@ huggingface-cli login
 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
 
 # python train_text_to_image.py \
+accelerate launch train_text_to_image.py     \
+    --use_auth_token     \
+    --cinemanet_dset_path /home/synopsis/datasets/stable-diffusion/cinematic-captions__2022-10-04__prompt-engineered__captions__all-concepts.feather     \
+    --mixed_precision fp16     \
+    --resolution 512     \
+    --gradient_accumulation_steps 2     \
+    --train_batch_size 2     \
+    --num_train_epochs 17     \
+    --max_train_steps 270000 \
+    --use_ema \
+    --output_dir sd-cinematic-captions__prompt-engineered
+
 python train_text_to_image.py \
     --use_auth_token \
     --cinemanet_dset_path /home/synopsis/datasets/stable-diffusion/cinemanet-captions.feather \
@@ -608,7 +620,7 @@ def main():
     )
 
     if args.use_ema:
-        ema_unet = EMAModel(unet, device="cpu")
+        ema_unet = EMAModel(unet, device=torch.device(2))
 
     # Move vae and unet to device
     vae.to(accelerator.device)
@@ -717,33 +729,8 @@ def main():
                 except:
                     breakpoint()
 
-    # FIXME: Duplicated chunk from before, but whatever...
     except KeyboardInterrupt:
-        accelerator.wait_for_everyone()
-        if accelerator.is_main_process:
-            pipeline = StableDiffusionPipeline(
-                text_encoder=text_encoder,
-                vae=vae,
-                unet=accelerator.unwrap_model(ema_unet.averaged_model if args.use_ema else unet),
-                tokenizer=tokenizer,
-                scheduler=PNDMScheduler(
-                    beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", skip_prk_steps=True
-                ),
-                safety_checker=StableDiffusionSafetyChecker.from_pretrained("CompVis/stable-diffusion-safety-checker"),
-                feature_extractor=CLIPFeatureExtractor.from_pretrained("openai/clip-vit-base-patch32"),
-            )
-            save_dir = Path(args.output_dir) / "end-of-training"
-            save_dir.mkdir(exist_ok=True)
-            save_dir = str(save_dir)
-            pipeline.save_pretrained(save_dir)
-            # pipeline.save_pretrained(args.output_dir)
-
-            if args.push_to_hub:
-                repo.push_to_hub(
-                    args, pipeline, repo, commit_message="End of training", blocking=False, auto_lfs_prune=True
-                )
-
-        accelerator.end_training()
+        pass
 
     # Create the pipeline using the trained modules and save it.
     accelerator.wait_for_everyone()
@@ -759,7 +746,7 @@ def main():
             safety_checker=StableDiffusionSafetyChecker.from_pretrained("CompVis/stable-diffusion-safety-checker"),
             feature_extractor=CLIPFeatureExtractor.from_pretrained("openai/clip-vit-base-patch32"),
         )
-        save_dir = Path(args.output_dir) / "end-of-training"
+        save_dir = Path(args.output_dir) / f"end-of-training-epoch-{epoch}"
         save_dir.mkdir(exist_ok=True)
         save_dir = str(save_dir)
         pipeline.save_pretrained(save_dir)
